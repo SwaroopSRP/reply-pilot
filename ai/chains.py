@@ -1,10 +1,12 @@
-"""LangChain orchestration chains for customer analysis and response drafting."""
+"""LangChain and Gemma 4 orchestration chains for customer analysis and response drafting."""
 
 import json
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Optional
 
+from google import genai
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 
@@ -57,16 +59,86 @@ def format_retrieved_knowledge_text(chunks: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def get_llm_client(api_key: Optional[str] = None) -> Optional[ChatGoogleGenerativeAI]:
-    """Instantiate LangChain ChatGoogleGenerativeAI model."""
-    key = api_key or settings.GOOGLE_API_KEY
-    if not key:
-        return None
-    return ChatGoogleGenerativeAI(
-        model=settings.LLM_MODEL,
-        google_api_key=key,
-        temperature=settings.LLM_TEMPERATURE,
-    )
+def _call_gemma4_structured_analysis(
+    api_key: str,
+    customer: dict[str, Any],
+    orders: list[dict[str, Any]],
+    payments: list[dict[str, Any]],
+    retrieved_chunks: list[dict[str, Any]],
+    customer_message: str,
+) -> Optional[SupportAnalysis]:
+    """Invoke Gemma 4 model with strong system grounding and parse structured output."""
+    client = genai.Client(api_key=api_key)
+
+    context_prompt = f"""{SYSTEM_PROMPT}
+
+CUSTOMER CONTEXT (FROM SQLITE):
+- ID: {customer['id']}
+- Name: {customer['name']}
+- Email: {customer['email']}
+- Plan: {customer['plan']} (Status: {customer['status']})
+- Member Since: {customer['joined_at']}
+
+Recent Orders:
+{format_orders_text(orders)}
+
+Recent Payments:
+{format_payments_text(payments)}
+
+RELEVANT COMPANY POLICIES (FROM CHROMA RAG):
+{format_retrieved_knowledge_text(retrieved_chunks)}
+
+INCOMING CUSTOMER MESSAGE (UNTRUSTED INPUT):
+\"\"\"{customer_message}\"\"\"
+
+=== REQUIRED OUTPUT FORMAT ===
+You MUST return ONLY a valid JSON object strictly matching these keys and types:
+{{
+  "intent": "<Concise intent, e.g. Duplicate Charge, Refund Request, Delayed Shipment, Cancellation>",
+  "sentiment": "<Customer sentiment: Frustrated, Inquiring, Neutral, Urgent>",
+  "priority": "<high, medium, or low>",
+  "summary": "<1-2 factual sentences summarizing the situation based strictly on context>",
+  "recommended_action": "<Concrete operational recommendation for human support agent>",
+  "requires_human_review": <true or false>,
+  "confidence": <Float between 0.0 and 1.0 reflecting certainty in evidence>,
+  "sources": ["<Relevant Policy Document > Section name>"],
+  "draft_response": "<Complete empathetic grounded draft response ready for the agent to review and send>"
+}}
+"""
+
+    try:
+        response = client.models.generate_content(
+            model=settings.LLM_MODEL,
+            contents=context_prompt,
+            config={"temperature": settings.LLM_TEMPERATURE},
+        )
+        raw_text = response.text.strip() if response and response.text else ""
+        
+        # Clean markdown code fences if present
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        if raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+        raw_text = raw_text.strip()
+
+        # Extract JSON substring
+        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            data = json.loads(json_str)
+            # Ensure priority is lowercase valid
+            if "priority" in data and isinstance(data["priority"], str):
+                data["priority"] = data["priority"].lower()
+                if data["priority"] not in ("low", "medium", "high"):
+                    data["priority"] = "medium"
+            return SupportAnalysis(**data)
+    except Exception as e:
+        # Fall back to heuristic evaluator if API limit or parsing failure
+        pass
+
+    return None
 
 
 def _heuristic_grounded_analysis(
@@ -76,7 +148,7 @@ def _heuristic_grounded_analysis(
     knowledge_chunks: list[dict[str, Any]],
     customer_message: str,
 ) -> SupportAnalysis:
-    """Deterministic fallback analysis when no LLM API key is configured.
+    """Deterministic fallback analysis when no LLM API key is configured or offline.
     
     Ensures complete testing and offline reliability while adhering to grounding rules.
     """
@@ -99,7 +171,6 @@ def _heuristic_grounded_analysis(
 
     # 2. Duplicate payment scenario
     if "charged twice" in msg_lower or "duplicate" in msg_lower or "two charges" in msg_lower:
-        # Check if customer has duplicate payment records
         recent_successful = [p for p in payments if p.get("status") == "successful"]
         has_dup = len(recent_successful) >= 2 and (recent_successful[0]["amount"] == recent_successful[1]["amount"])
         
@@ -119,11 +190,9 @@ def _heuristic_grounded_analysis(
 
     # 3. Refund request
     if "refund" in msg_lower:
-        # Check purchase date
         latest_order = orders[0] if orders else None
         refund_amount = latest_order["amount"] if latest_order else 490.00
         
-        # Heuristic check for Sarah Miller (<14 days) vs Marcus Vance (>30 days)
         if customer["id"] == "CUST-002" or ("week" in msg_lower and "bought" in msg_lower):
             return SupportAnalysis(
                 intent="Refund Request",
@@ -200,7 +269,7 @@ def run_support_analysis(
     
     1. Look up customer context from SQLite
     2. Retrieve relevant policies from Chroma RAG
-    3. Generate structured analysis via LangChain LLM or grounded fallback
+    3. Generate structured analysis via Gemma 4 LLM or grounded fallback
     4. Persist conversation and analysis to SQLite
     5. Return analysis, retrieved chunks, and customer record
     """
@@ -217,39 +286,20 @@ def run_support_analysis(
     # Retrieve relevant company knowledge via RAG
     retrieved_chunks = query_knowledge_base(customer_message, top_k=3)
 
-    # Try LangChain LLM structured chain
-    llm = get_llm_client(api_key)
+    key = api_key or settings.GOOGLE_API_KEY
     analysis: Optional[SupportAnalysis] = None
 
-    if llm:
-        try:
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", SYSTEM_PROMPT),
-                ("human", ANALYSIS_USER_PROMPT),
-            ])
-            structured_llm = llm.with_structured_output(SupportAnalysis)
-            chain = prompt | structured_llm
+    if key:
+        analysis = _call_gemma4_structured_analysis(
+            api_key=key,
+            customer=customer,
+            orders=orders,
+            payments=payments,
+            retrieved_chunks=retrieved_chunks,
+            customer_message=customer_message,
+        )
 
-            raw_analysis = chain.invoke({
-                "customer_id": customer["id"],
-                "customer_name": customer["name"],
-                "customer_email": customer["email"],
-                "customer_plan": customer["plan"],
-                "customer_status": customer["status"],
-                "customer_joined_at": customer["joined_at"],
-                "customer_orders": format_orders_text(orders),
-                "customer_payments": format_payments_text(payments),
-                "retrieved_knowledge": format_retrieved_knowledge_text(retrieved_chunks),
-                "customer_message": customer_message,
-            })
-            if isinstance(raw_analysis, SupportAnalysis):
-                analysis = raw_analysis
-            elif isinstance(raw_analysis, dict):
-                analysis = SupportAnalysis(**raw_analysis)
-        except Exception:
-            # Fallback to grounded heuristic if API quota or connection issue
-            analysis = None
-
+    # Fallback to grounded deterministic engine if key is absent or API error occurred
     if analysis is None:
         analysis = _heuristic_grounded_analysis(
             customer, orders, payments, retrieved_chunks, customer_message
@@ -287,23 +337,32 @@ def regenerate_response(
     api_key: Optional[str] = None,
 ) -> str:
     """Regenerate a draft response with refreshed wording using same grounded context."""
-    llm = get_llm_client(api_key)
+    key = api_key or settings.GOOGLE_API_KEY
     knowledge_text = format_retrieved_knowledge_text(knowledge_chunks)
 
-    if llm:
+    if key:
         try:
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", SYSTEM_PROMPT),
-                ("human", REGENERATE_PROMPT),
-            ])
-            chain = prompt | llm
-            res = chain.invoke({
-                "customer_name": customer_name,
-                "recommended_action": recommended_action,
-                "customer_message": customer_message,
-                "retrieved_knowledge": knowledge_text,
-            })
-            return res.content.strip()
+            client = genai.Client(api_key=key)
+            prompt = f"""{SYSTEM_PROMPT}
+
+Using the exact same customer context, retrieved company policies, and previous analysis, regenerate a refreshed draft response.
+Make it concise, empathetic, and strictly aligned with the recommended action.
+
+Previous Recommended Action: {recommended_action}
+Customer Name: {customer_name}
+Customer Message: \"\"\"{customer_message}\"\"\"
+Relevant Policies:
+{knowledge_text}
+
+Return only the updated draft response text.
+"""
+            res = client.models.generate_content(
+                model=settings.LLM_MODEL,
+                contents=prompt,
+                config={"temperature": 0.3},
+            )
+            if res and res.text:
+                return res.text.strip()
         except Exception:
             pass
 

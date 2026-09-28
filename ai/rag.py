@@ -9,6 +9,9 @@ Handles:
 """
 
 import os
+# Prevent HuggingFace from making slow remote network requests when model is cached
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
 from pathlib import Path
 from typing import Any, Optional
 import chromadb

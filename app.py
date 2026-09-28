@@ -193,6 +193,11 @@ def setup_application():
     init_db()
     seed_database(force=False)
     initialize_vector_store(force_reindex=False)
+    # Pre-warm local sentence-transformers so first search is instantaneous
+    try:
+        query_knowledge_base("warmup query", top_k=1)
+    except Exception:
+        pass
     return True
 
 setup_application()
@@ -233,11 +238,11 @@ with st.sidebar:
     # Check current API key status
     active_key = settings.GOOGLE_API_KEY
     sidebar_key = st.text_input(
-        "Gemini API Key",
+        "Gemini / Gemma API Key",
         value=active_key,
         type="password",
         placeholder="Enter AI Studio API Key",
-        help="Google Gemini API Key for live LLM inference. If blank, uses grounded deterministic evaluation.",
+        help="Google Generative Language API Key. If blank, uses grounded deterministic evaluation.",
     )
     
     if sidebar_key:
@@ -245,7 +250,19 @@ with st.sidebar:
     else:
         st.info("Offline Grounded Evaluation Mode", icon="ℹ️")
 
-    st.caption(f"Model: `{settings.LLM_MODEL}`")
+    model_options = {
+        "gemini-3.5-flash-lite": "Gemini 3.5 Flash-Lite (⚡ ~1.5s Fast)",
+        "gemini-3.5-flash": "Gemini 3.5 Flash (Balanced ~3s)",
+        "gemma-4-26b-a4b-it": "Gemma 4 (MoE ~25s)",
+    }
+    selected_model = st.selectbox(
+        "Model Selection",
+        options=list(model_options.keys()),
+        format_func=lambda m: model_options.get(m, m),
+        index=0,
+        help="Choose between lightning fast Gemini Flash-Lite (~1.5s) or Gemma 4.",
+    )
+
     st.caption(f"Embeddings: `{settings.EMBEDDING_MODEL}`")
     st.caption("Vector Store: `ChromaDB (Local)`")
     st.caption("Database: `SQLite (replypilot.db)`")
@@ -338,6 +355,7 @@ if view_mode == "Analyze Request":
                         customer_id=selected_cust_id,
                         customer_message=message_input,
                         api_key=sidebar_key,
+                        model_name=selected_model,
                     )
                     st.session_state.current_analysis = analysis
                     st.session_state.current_chunks = chunks
@@ -546,6 +564,7 @@ if view_mode == "Analyze Request":
                             customer_message=st.session_state.customer_message_input,
                             knowledge_chunks=chunks,
                             api_key=sidebar_key,
+                            model_name=selected_model,
                         )
                         st.session_state.draft_response_text = refreshed
                         st.rerun()

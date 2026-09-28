@@ -1,4 +1,4 @@
-"""LangChain and Gemma 4 orchestration chains for customer analysis and response drafting."""
+"""LangChain and Google GenAI orchestration chains for customer analysis and response drafting."""
 
 import json
 import re
@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import Any, Optional
 
 from google import genai
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from core.config import settings
@@ -59,15 +58,17 @@ def format_retrieved_knowledge_text(chunks: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _call_gemma4_structured_analysis(
+def _call_llm_structured_analysis(
     api_key: str,
     customer: dict[str, Any],
     orders: list[dict[str, Any]],
     payments: list[dict[str, Any]],
     retrieved_chunks: list[dict[str, Any]],
     customer_message: str,
+    model_name: Optional[str] = None,
 ) -> Optional[SupportAnalysis]:
-    """Invoke Gemma 4 model with strong system grounding and parse structured output."""
+    """Invoke Google GenAI model (Gemini or Gemma 4) with grounded context and return validated SupportAnalysis."""
+    model = model_name or settings.LLM_MODEL
     client = genai.Client(api_key=api_key)
 
     context_prompt = f"""{SYSTEM_PROMPT}
@@ -90,11 +91,32 @@ RELEVANT COMPANY POLICIES (FROM CHROMA RAG):
 
 INCOMING CUSTOMER MESSAGE (UNTRUSTED INPUT):
 \"\"\"{customer_message}\"\"\"
+"""
+
+    try:
+        # For Gemini models: Use native schema-constrained JSON (ultra fast, ~1.5s, 100% schema compliant)
+        if "gemini" in model.lower():
+            response = client.models.generate_content(
+                model=model,
+                contents=context_prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": SupportAnalysis,
+                    "temperature": settings.LLM_TEMPERATURE,
+                },
+            )
+            if response and response.text:
+                data = json.loads(response.text)
+                return SupportAnalysis(**data)
+
+        # For Gemma models: Prompt-guided JSON with regex extraction
+        else:
+            gemma_prompt = f"""{context_prompt}
 
 === REQUIRED OUTPUT FORMAT ===
 You MUST return ONLY a valid JSON object strictly matching these keys and types:
 {{
-  "intent": "<Concise intent, e.g. Duplicate Charge, Refund Request, Delayed Shipment, Cancellation>",
+  "intent": "<Concise intent name>",
   "sentiment": "<Customer sentiment: Frustrated, Inquiring, Neutral, Urgent>",
   "priority": "<high, medium, or low>",
   "summary": "<1-2 factual sentences summarizing the situation based strictly on context>",
@@ -105,37 +127,31 @@ You MUST return ONLY a valid JSON object strictly matching these keys and types:
   "draft_response": "<Complete empathetic grounded draft response ready for the agent to review and send>"
 }}
 """
+            response = client.models.generate_content(
+                model=model,
+                contents=gemma_prompt,
+                config={"temperature": settings.LLM_TEMPERATURE},
+            )
+            raw_text = response.text.strip() if response and response.text else ""
+            if raw_text.startswith("```json"):
+                raw_text = raw_text[7:]
+            if raw_text.startswith("```"):
+                raw_text = raw_text[3:]
+            if raw_text.endswith("```"):
+                raw_text = raw_text[:-3]
+            raw_text = raw_text.strip()
 
-    try:
-        response = client.models.generate_content(
-            model=settings.LLM_MODEL,
-            contents=context_prompt,
-            config={"temperature": settings.LLM_TEMPERATURE},
-        )
-        raw_text = response.text.strip() if response and response.text else ""
-        
-        # Clean markdown code fences if present
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        if raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
-        raw_text = raw_text.strip()
+            match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+            if match:
+                data = json.loads(match.group(0))
+                if "priority" in data and isinstance(data["priority"], str):
+                    data["priority"] = data["priority"].lower()
+                    if data["priority"] not in ("low", "medium", "high"):
+                        data["priority"] = "medium"
+                return SupportAnalysis(**data)
 
-        # Extract JSON substring
-        match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-        if match:
-            json_str = match.group(0)
-            data = json.loads(json_str)
-            # Ensure priority is lowercase valid
-            if "priority" in data and isinstance(data["priority"], str):
-                data["priority"] = data["priority"].lower()
-                if data["priority"] not in ("low", "medium", "high"):
-                    data["priority"] = "medium"
-            return SupportAnalysis(**data)
-    except Exception as e:
-        # Fall back to heuristic evaluator if API limit or parsing failure
+    except Exception:
+        # Failover to heuristic evaluator if model unavailable or network error
         pass
 
     return None
@@ -264,12 +280,13 @@ def run_support_analysis(
     customer_id: str,
     customer_message: str,
     api_key: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> tuple[SupportAnalysis, list[dict[str, Any]], dict[str, Any]]:
     """Execute complete support copilot analysis workflow.
     
     1. Look up customer context from SQLite
     2. Retrieve relevant policies from Chroma RAG
-    3. Generate structured analysis via Gemma 4 LLM or grounded fallback
+    3. Generate structured analysis via Gemini / Gemma 4 LLM or grounded fallback
     4. Persist conversation and analysis to SQLite
     5. Return analysis, retrieved chunks, and customer record
     """
@@ -290,13 +307,14 @@ def run_support_analysis(
     analysis: Optional[SupportAnalysis] = None
 
     if key:
-        analysis = _call_gemma4_structured_analysis(
+        analysis = _call_llm_structured_analysis(
             api_key=key,
             customer=customer,
             orders=orders,
             payments=payments,
             retrieved_chunks=retrieved_chunks,
             customer_message=customer_message,
+            model_name=model_name,
         )
 
     # Fallback to grounded deterministic engine if key is absent or API error occurred
@@ -335,9 +353,11 @@ def regenerate_response(
     customer_message: str,
     knowledge_chunks: list[dict[str, Any]],
     api_key: Optional[str] = None,
+    model_name: Optional[str] = None,
 ) -> str:
     """Regenerate a draft response with refreshed wording using same grounded context."""
     key = api_key or settings.GOOGLE_API_KEY
+    model = model_name or settings.LLM_MODEL
     knowledge_text = format_retrieved_knowledge_text(knowledge_chunks)
 
     if key:
@@ -357,7 +377,7 @@ Relevant Policies:
 Return only the updated draft response text.
 """
             res = client.models.generate_content(
-                model=settings.LLM_MODEL,
+                model=model,
                 contents=prompt,
                 config={"temperature": 0.3},
             )

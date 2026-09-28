@@ -26,7 +26,7 @@ class Settings:
     # LLM Provider Configuration
     # Uses Gemma 4 (gemma-4-26b-a4b-it) or Gemini on Google Generative Language API
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
-    LLM_MODEL: str = os.getenv("LLM_MODEL", "gemma-4-26b-a4b-it")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "gemini-3.5-flash-lite")
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.1"))
 
     # Vector store & Embeddings
